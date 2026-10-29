@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mayor on Delivery Duty · Prototype 0.6</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#17221e;color:#f1ecd8;font:15px monospace}canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated}#hud{position:fixed;top:12px;left:12px;right:12px;pointer-events:none;display:flex;justify-content:space-between;gap:12px;align-items:start}#street{background:#17633d;border:3px solid #edf0df;padding:8px 20px;box-shadow:4px 4px 0 #092717;font-weight:900;letter-spacing:2px}#info{text-align:right;background:#13241eed;padding:10px 14px;border:3px solid #69816c;max-width:52vw}#arrow{font-size:32px;color:#ffc65b;line-height:1}#controls{position:fixed;bottom:12px;left:12px;background:#13241eed;padding:8px 12px;font-size:12px}#panel{position:fixed;inset:0;background:#0d1816e8;display:grid;place-items:center;padding:18px}#panel[hidden]{display:none}#card{max-width:520px;width:100%;padding:24px;background:#24382f;border:4px solid #91a084;box-shadow:8px 8px 0 #0c1712}h1{font-size:26px;margin:0 0 8px}p{line-height:1.5}button{background:#edbc63;color:#232b22;border:0;padding:10px 16px;font-weight:800;cursor:pointer;margin:3px;font:inherit}button.secondary{background:#52685c;color:white}.small{font-size:12px;color:#c5cebb}#joblist button{display:block;text-align:left;width:100%;margin:7px 0;background:#d6e0c5}#touch{position:fixed;bottom:12px;right:12px;display:none;gap:8px}#touch button{min-width:48px;min-height:48px;touch-action:none}@media(pointer:coarse){#touch{display:flex}#controls{display:none}}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud"><div id="street">MAIN ST</div><div id="info"><div id="clock">03:00</div><div id="arrow">↗</div><div id="target">Choose a delivery</div><div id="status" class="small">Car: 100%</div></div></div>
+<div id="controls">W/↑ accelerate · S/↓ brake/reverse · A/D or ←/→ steer · Space handbrake · Slow down at a stop to pickup/deliver · J jobs</div>
+<div id="touch"><button data-key="ArrowLeft">↶</button><button data-key="ArrowUp">▲</button><button data-key="ArrowDown">▼</button><button data-key="ArrowRight">↷</button><button data-key="KeyJ">J</button></div>
+<div id="panel"><div id="card"><h1>Mayor on Delivery Duty</h1><p>Congratulations. Nobody else ran for mayor, so you won. Unfortunately, delivering things still pays better.</p><p>Drive the broken streets of your tiny town. Learn its layout from street names and an eight-way arrow. There is no minimap.</p><p class="small">Each shift lasts three minutes. Accepting a job is a promise. Failing it hurts your reputation more than passing it over.</p><div><label>Town seed <input id="seed" value="DITCHWATER" maxlength="32" style="font:inherit;width:150px;padding:6px"></label></div><button id="start">Start shift</button></div></div>
+<script>
+(()=>{'use strict';
+const canvas=document.querySelector('#game'),screenCtx=canvas.getContext('2d'),buffer=document.createElement('canvas'),ctx=buffer.getContext('2d'),panel=document.querySelector('#panel'),card=document.querySelector('#card');
+const VIEW_W=384,VIEW_H=216;buffer.width=VIEW_W;buffer.height=VIEW_H;
+const $=id=>document.getElementById(id); const TILE=155, ROAD=88, COLS=6,ROWS=6,W=(COLS+1)*TILE,H=(ROWS+1)*TILE,DAY=180;
+let rng,seed,roads=[],buildings=[],hazards=[],jobs=[],tiles=[],car,elapsed=0,playing=false,last=0,score=0,reputation=50,active=null,notice='',noticeTime=0,effects=[],smokeClock=0;
+const keys=new Set(), clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+function hash(s){let h=2166136261;for(let c of s){h=Math.imul(h^c.charCodeAt(0),16777619)}return h>>>0}
+function random(){let t=rng+=0x6D2B79F5;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return ((t^t>>>14)>>>0)/4294967296}
+function pick(a){return a[Math.floor(random()*a.length)]}
+const ordinal=n=>n+(n%10===1&&n%100!==11?'st':n%10===2&&n%100!==12?'nd':n%10===3&&n%100!==13?'rd':'th');
+function pointOn(r,t){return {x:r.a.x+(r.b.x-r.a.x)*t,y:r.a.y+(r.b.y-r.a.y)*t}}
+function projected(r,x,y){let dx=r.b.x-r.a.x,dy=r.b.y-r.a.y,t=clamp(((x-r.a.x)*dx+(y-r.a.y)*dy)/(dx*dx+dy*dy),0,1),p=pointOn(r,t);return {x:p.x,y:p.y,d:Math.hypot(x-p.x,y-p.y),t}}
+function setup(raw){seed=raw||'DITCHWATER';rng=hash(seed);let hNames=pick([['1st','2nd','3rd','4th','5th','6th'],['Lincoln','Washington','Jefferson','Madison','Monroe','Adams'],['Oak','Maple','Elm','Pine','Cedar','Birch']]);let vNames=pick([['A','B','C','D','E','F'],['Oak','Maple','Elm','Pine','Cedar','Birch'],['1st','2nd','3rd','4th','5th','6th']]);
+// A seeded, connected network: start with a wandering spanning tree, then add loops.
+let nodes=[];for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++)nodes.push({x:(x+1)*TILE+(random()-.5)*64,y:(y+1)*TILE+(random()-.5)*64,id:y*COLS+x,gx:x,gy:y});
+let candidates=[];for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++){let i=y*COLS+x;if(x<COLS-1)candidates.push({i,j:i+1,axis:'h',line:y});if(y<ROWS-1)candidates.push({i,j:i+COLS,axis:'v',line:x})}
+let visited=new Set([Math.floor(ROWS/2)*COLS+Math.floor(COLS/2)]),chosen=[];
+while(visited.size<nodes.length){let fringe=candidates.filter(e=>visited.has(e.i)!==visited.has(e.j));let e=pick(fringe);chosen.push(e);visited.add(e.i);visited.add(e.j)}
+for(let e of candidates){if(!chosen.includes(e)&&random()<.58)chosen.push(e)}
+roads=chosen.map(e=>({a:nodes[e.i],b:nodes[e.j],name:e.axis==='h'?hNames[e.line]+' St':vNames[e.line]+' Ave'}));
+buildings=[];const kinds=['GAS & GO','DINER','GENERAL STORE','CITY HALL','FARM SUPPLY','PHARMACY','HOUSE','HOUSE','HOUSE','HOUSE','HOUSE','HOUSE','DEPOT','GARAGE'];
+const used=[];for(let kind of kinds){let placed=false;for(let tries=0;tries<180&&!placed;tries++){let r=pick(roads),t=.25+random()*.5,entry=pointOn(r,t),dx=r.b.x-r.a.x,dy=r.b.y-r.a.y,len=Math.hypot(dx,dy),side=random()<.5?-1:1,offset=ROAD/2+30,bx=entry.x-side*dy/len*offset,by=entry.y+side*dx/len*offset;
+if(bx<25||bx>W-25||by<25||by>H-25||used.some(p=>Math.hypot(p.x-bx,p.y-by)<72))continue;
+// Leave the building outside the pavement of all nearby road segments.
+if(roads.some(other=>projected(other,bx,by).d<ROAD/2+15))continue;
+used.push({x:bx,y:by});buildings.push({kind,x:bx,y:by,entry,color:pick(['#b88c68','#a86f60','#baa477','#8fa8a0','#b5a0ad'])});placed=true}}
+hazards=[];for(let i=0;i<26;i++){let r=pick(roads),t=.12+random()*.76,p=pointOn(r,t),dx=r.b.x-r.a.x,dy=r.b.y-r.a.y,len=Math.hypot(dx,dy),offset=(random()-.5)*ROAD*.55;hazards.push({x:p.x-dy/len*offset,y:p.y+dx/len*offset,type:random()<.68?'pothole':'trash',radius:random()*5+6})}
+tiles=[];for(let y=0;y<Math.ceil(H/32);y++){let row=[];for(let x=0;x<Math.ceil(W/32);x++){let d=nearestRoad(x*32+16,y*32+16).d,n=hash(seed+':'+x+':'+y);let tile=d<ROAD/2-8?(n%13===0?6:n%5===0?3:2):d<ROAD/2+10?4:d<ROAD/2+24?5:n%3===0?1:0;row.push(tile)}tiles.push(row)}
+jobs=[];let jobSites=buildings.filter(b=>b.kind!=='CITY HALL');for(let i=0;i<7;i++){let from=pick(jobSites),to=pick(jobSites.filter(b=>b!==from));jobs.push({id:i,from,to,pay:Math.round(25+random()*85),state:'available',title:from.kind+' → '+to.kind})}
+let city=buildings.find(b=>b.kind==='CITY HALL');car={x:city.entry.x,y:city.entry.y,a:-Math.PI/2,speed:0,health:100,invuln:0};elapsed=0;score=0;reputation=50;active=null;notice='';noticeTime=0;effects=[];smokeClock=0;}
+function nearestRoad(x,y){let best=null,dist=Infinity;for(let r of roads){let d=projected(r,x,y).d;if(d<dist){best=r;dist=d}}return {r:best,d:dist}}
+// Art is loaded as independent PNG files; no procedural sprite painting at runtime.
+const art={};const assets=['terrain','house','diner','gas','hall','store','farm','pharmacy','depot','garage','car','pothole','trash','package','smoke'];
+function loadArt(){return Promise.all(assets.map(name=>new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>{art[name]=img;resolve()};img.onerror=()=>reject(new Error('Missing artwork: assets/'+name+'.png'));img.src='assets/'+name+'.png'})))}
+const buildingArt={'GAS & GO':'gas','DINER':'diner','GENERAL STORE':'store','CITY HALL':'hall','FARM SUPPLY':'farm','PHARMACY':'pharmacy','HOUSE':'house','DEPOT':'depot','GARAGE':'garage'};
+function announce(s){notice=s;noticeTime=2.5}
+function jobMenu(){playing=false;panel.hidden=false;let avail=jobs.filter(j=>j.state==='available');card.innerHTML='<h1>Dispatch board</h1><p>Pick up at the first building, then deliver to the second. You can only promise one at a time.</p><div id="joblist"></div><button class="secondary" id="resume">Back to driving</button>';let list=$('joblist');if(active){let p=document.createElement('p');p.textContent='Current commitment: '+active.title;list.append(p)}for(let j of avail){let b=document.createElement('button');b.textContent=j.title+' · $'+j.pay;b.disabled=!!active;b.onclick=()=>{j.state='accepted';active=j;panel.hidden=true;playing=true;last=performance.now();announce('Job accepted: '+j.title)};list.append(b)}if(!avail.length)list.textContent='No more available requests today.';$('resume').onclick=()=>{panel.hidden=true;playing=true;last=performance.now()}}
+function finish(){playing=false;panel.hidden=false;if(active){active.state='failed';reputation-=10;active=null}let skipped=jobs.filter(j=>j.state==='available').length;reputation-=Math.min(5,skipped);card.innerHTML='<h1>End of shift</h1><p>You earned <strong>$'+score+'</strong>. Your reliability stands at <strong>'+reputation+'</strong>.</p><p>'+jobs.filter(j=>j.state==='done').length+' deliveries completed · '+skipped+' requests passed over.</p><p class="small">Accepted-but-failed jobs cost 10 reputation. Unaccepted jobs have a smaller combined effect.</p><button id="again">Another shift, same town</button><button class="secondary" id="new">New town</button>';$('again').onclick=()=>{setup(seed);panel.hidden=true;playing=true;last=performance.now()};$('new').onclick=()=>{card.innerHTML='<h1>New town</h1><p>Seed</p><input id="newseed" value="'+seed.replace(/[&<>"']/g,'')+'"><button id="go">Generate</button>';$('go').onclick=()=>{setup($('newseed').value);panel.hidden=true;playing=true;last=performance.now()}}}
+function interact(){if(!active)return;let b=active.stage==='drop'?active.to:active.from;let d=Math.hypot(car.x-b.entry.x,car.y-b.entry.y);if(d>31||Math.abs(car.speed)>72)return;
+if(active.stage==='drop'){
+ effects.push({type:'package',x:car.x,y:car.y,sx:car.x,sy:car.y,tx:b.x,ty:b.y,age:0,life:.55});
+ active.state='done';score+=active.pay;reputation+=3;announce('Delivered! +$'+active.pay);active=null;
+}else{active.stage='drop';announce('Cargo aboard. Head to '+active.to.kind)}}
+function update(dt){elapsed+=dt;if(elapsed>=DAY){finish();return}car.invuln=Math.max(0,car.invuln-dt);noticeTime=Math.max(0,noticeTime-dt);let f=keys.has('ArrowUp')||keys.has('KeyW'),back=keys.has('ArrowDown')||keys.has('KeyS'),left=keys.has('ArrowLeft')||keys.has('KeyA'),right=keys.has('ArrowRight')||keys.has('KeyD'),hand=keys.has('Space');let offroad=nearestRoad(car.x,car.y).d>ROAD/2-7;
+if(f)car.speed+=(offroad?125:250)*dt;if(back)car.speed-=300*dt;
+car.speed*=Math.pow(hand?.955:offroad?.982:.994,dt*60);
+car.speed=clamp(car.speed,offroad?-32:-105,offroad?62:245);
+let steer=(right?1:0)-(left?1:0);car.a+=steer*(2.6-.45*Math.min(1,Math.abs(car.speed)/245))*dt*(car.speed<0?-1:1);
+if(!f&&!back&&Math.abs(car.speed)<1.5)car.speed=0;
+// The verge is slow but always traversable. Only the outer map boundary stops movement.
+let nx=clamp(car.x+Math.cos(car.a)*car.speed*dt,10,W-10),ny=clamp(car.y+Math.sin(car.a)*car.speed*dt,10,H-10);
+car.x=nx;car.y=ny;for(let h of hazards){if(Math.hypot(car.x-h.x,car.y-h.y)<h.radius+9&&car.invuln<=0){car.speed*=h.type==='pothole'?.72:.55;car.health=Math.max(0,car.health-(h.type==='pothole'?4:3));car.invuln=.85;announce(h.type==='pothole'?'Pothole! Suspension damage':'Debris! Vehicle damage')}}if(car.health<=0){car.health=25;car.speed=0;score=Math.max(0,score-30);announce('Emergency repairs: -$30')}
+// Automatic roadside handoff: get close and slow down. No interaction key required.
+interact();
+smokeClock-=dt;let turning=(left||right),sliding=hand&&Math.abs(car.speed)>60;
+if(smokeClock<=0&&Math.abs(car.speed)>105&&(turning||sliding)){
+ let bx=car.x-Math.cos(car.a)*14,by=car.y-Math.sin(car.a)*14;
+ for(let i=0;i<2;i++)effects.push({type:'smoke',x:bx+(Math.random()-.5)*10,y:by+(Math.random()-.5)*10,age:0,life:.45+Math.random()*.3,size:3+Math.floor(Math.random()*4)});
+ smokeClock=sliding?.035:.075;
+}
+for(let e of effects){e.age+=dt;if(e.type==='smoke'){e.x-=Math.cos(car.a)*9*dt;e.y-=Math.sin(car.a)*9*dt}}
+effects=effects.filter(e=>e.age<e.life);
+}
+function draw(){let cw=VIEW_W,ch=VIEW_H;ctx.setTransform(1,0,0,1,0,0);ctx.fillStyle='#263a31';ctx.fillRect(0,0,cw,ch);const zoom=.64;ctx.save();ctx.translate(Math.round(cw/2-car.x*zoom),Math.round(ch/2-car.y*zoom));ctx.scale(zoom,zoom);
+ctx.imageSmoothingEnabled=false;
+for(let y=0;y<tiles.length;y++)for(let x=0;x<tiles[y].length;x++){ctx.drawImage(art.terrain,tiles[y][x]*32,0,32,32,x*32,y*32,32,32)}
+for(let b of buildings){ctx.drawImage(art[buildingArt[b.kind]],Math.round(b.x-32),Math.round(b.y-34),64,64)}
+for(let h of hazards){ctx.drawImage(art[h.type],Math.round(h.x-8),Math.round(h.y-8),16,16)}
+if(active){let b=active.stage==='drop'?active.to:active.from;let pulse=Math.floor(performance.now()/280)%2;
+ ctx.fillStyle=pulse?'#f8dd80':'#b8884c';let x=Math.round(b.entry.x),y=Math.round(b.entry.y);
+ ctx.fillRect(x-18,y-18,10,4);ctx.fillRect(x+8,y-18,10,4);ctx.fillRect(x-18,y+14,10,4);ctx.fillRect(x+8,y+14,10,4);
+ ctx.fillRect(x-18,y-18,4,10);ctx.fillRect(x+14,y-18,4,10);ctx.fillRect(x-18,y+8,4,10);ctx.fillRect(x+14,y+8,4,10)}
+ctx.save();ctx.translate(Math.round(car.x),Math.round(car.y));ctx.rotate(car.a+Math.PI/2);ctx.drawImage(art.car,-9,-15);if(car.invuln>0){ctx.fillStyle='#f1ba70';ctx.fillRect(-8,-14,3,3)}ctx.restore();
+for(let e of effects){if(e.type==='smoke'){let p=e.age/e.life,s=12+Math.floor(p*12);ctx.drawImage(art.smoke,Math.round(e.x-s/2),Math.round(e.y-s/2),s,s)}else{let t=e.age/e.life;let x=e.sx+(e.tx-e.sx)*t,y=e.sy+(e.ty-e.sy)*t-Math.sin(Math.PI*t)*28;ctx.drawImage(art.package,Math.round(x-6),Math.round(y-6))}}
+ctx.restore();
+let sw=innerWidth,sh=innerHeight,dpr=devicePixelRatio||1;if(canvas.width!==Math.round(sw*dpr)||canvas.height!==Math.round(sh*dpr)){canvas.width=Math.round(sw*dpr);canvas.height=Math.round(sh*dpr)}screenCtx.setTransform(dpr,0,0,dpr,0,0);screenCtx.fillStyle='#17221e';screenCtx.fillRect(0,0,sw,sh);screenCtx.imageSmoothingEnabled=false;
+let scale=Math.min(sw/VIEW_W,sh/VIEW_H),dx=Math.floor((sw-VIEW_W*scale)/2),dy=Math.floor((sh-VIEW_H*scale)/2);screenCtx.drawImage(buffer,dx,dy,VIEW_W*scale,VIEW_H*scale);
+let street=nearestRoad(car.x,car.y).r.name.toUpperCase();$('street').textContent=street;$('clock').textContent=Math.max(0,Math.ceil(DAY-elapsed)/60|0).toString().padStart(2,'0')+':'+(Math.max(0,Math.ceil(DAY-elapsed))%60).toString().padStart(2,'0');let dest=active?(active.stage==='drop'?active.to:active.from):null;if(dest){let angle=Math.atan2(dest.entry.y-car.y,dest.entry.x-car.x);let index=(Math.round(angle/(Math.PI/4))+8)%8;$('arrow').textContent=['→','↘','↓','↙','←','↖','↑','↗'][index];$('target').textContent=(active.stage==='drop'?'Deliver: ':'Pick up: ')+dest.kind}else{$('arrow').textContent='◇';$('target').textContent='Press J for jobs'}$('status').textContent='Car '+Math.round(car.health)+'% · $'+score+' · Trust '+reputation+(noticeTime>0?' · '+notice:'');}
+function frame(t){let dt=Math.min((t-last)/1000,.035);last=t;if(playing)update(dt);draw();requestAnimationFrame(frame)}
+addEventListener('keydown',e=>{if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code))e.preventDefault();if(e.repeat)return;keys.add(e.code);if(playing&&e.code==='KeyJ')jobMenu()});addEventListener('keyup',e=>keys.delete(e.code));addEventListener('blur',()=>keys.clear());for(let b of document.querySelectorAll('#touch button')){b.addEventListener('pointerdown',e=>{e.preventDefault();let k=b.dataset.key;keys.add(k);if(k==='KeyJ'&&playing)jobMenu()});for(let event of ['pointerup','pointercancel','pointerleave'])b.addEventListener(event,()=>keys.delete(b.dataset.key))}
+$('start').disabled=true;$('start').textContent='Loading artwork…';
+loadArt().then(()=>{$('start').disabled=false;$('start').textContent='Start shift';setup('DITCHWATER');requestAnimationFrame(frame)}).catch(error=>{card.insertAdjacentHTML('beforeend','<p style="color:#ffc1a7">Artwork could not load. Keep index.html and the assets folder together. '+error.message+'</p>')});
+$('start').onclick=()=>{setup($('seed').value.trim());panel.hidden=true;playing=true;last=performance.now();jobMenu()};
+})();
+</script>
+</body></html>
